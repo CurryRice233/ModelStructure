@@ -1,0 +1,12 @@
+# OS / editor artifacts
+*.Zone.Identifier
+*:Zone.Identifier
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+
+# Temp
+*.tmp

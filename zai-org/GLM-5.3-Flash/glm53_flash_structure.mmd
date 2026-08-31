@@ -1,0 +1,214 @@
+%% GLM-5.3-Flash 整体结构图 (architectures: Glm5NextForConditionalGeneration, model_type glm5_next)
+%% config: https://huggingface.co/zai-org/GLM-5.3-Flash/resolve/main/config.json
+%% modeling: https://github.com/huggingface/transformers/blob/main/src/transformers/models/glm5_next/modeling_glm5_next.py
+%% text_config: H=4096, L=45 (layer_types: 34 linear_attention + 11 deepseek_sparse_attention, 自 layer 3 起每 4 层)
+%% mlp_layer_type: first_k_dense_replace=3 → 3 dense (Im 12288) + 42 sparse MoE (Im 2048, E=288, shared=1, topk=8, scale 2.5, sigmoid scoring + bias correction)
+%% mHC: hc_mult=4 (流 [B,S,4,4096]), fn [(2+4)·4=24, 16384], base [24], scale [3], Sinkhorn 20 iters, eps 1e-6, input_norm 无权重
+%% KDA 线性注意力: num_heads=64, head_dim=128 (qkv_dim 8192, conv_dim 24576), conv k=4, chunk 64, gate_lower_bound=-5, l2norm q,k, eps 1e-5
+%% MLA 稀疏注意力: q_lora_rank=1536, kv_lora_rank=512, qk_nope_head_dim=256, v_head_dim=256, qk_rope_head_dim=0 (NoPE, 文本无 RoPE), heads=64, scale=256^-0.5
+%% DSA indexer: index_n_heads=32, index_head_dim=128, index_topk=2048, kpool=4 → pool topk 512, 输出宽 2048+3=2051; 本配置 indexer_types 全 "full" (支持跨层共享未启用)
+%% 视觉: depth=24, hidden=1024, heads=16 (head_dim 64), intermediate=4096, patch 2×14×14, merge 2×2 → downsample Conv2d → out 4096, merger context 10240, SwiGLU clamp ±10
+%% 其他: vocab 154880, rms_norm_eps 1e-5, max_position_embeddings 1048576, FP8 block[128,128] 量化 (routed experts), num_nextn_predict_layers=1 (MTP layer 45 未在本文件实现)
+
+flowchart TD
+    classDef matmul fill:#90d6ab,stroke:#101843,stroke-width:1px,color:#191919
+    classDef act fill:#83ebdc,stroke:#101843,stroke-width:1px,color:#191919
+    classDef plain fill:#ffffff,stroke:#101843,stroke-width:1px,color:#191919
+    classDef dashed fill:#ffffff,stroke:#101843,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+
+    %% ================= 输入与嵌入 =================
+    ids["input_ids<br/>[B, S]"]:::dashed
+    pix["pixel_values (图像/视频, 可选)<br/>[Npx, 3·2·14·14 = 1176]"]:::dashed
+    embed["embed_tokens (Embedding)<br/>[V(154880), H(4096)]"]:::plain
+    masks["create_recurrent_attention_mask<br/>bool padding 掩码 [B, S] (两类层共用; 因果性由 indexer 处理)"]:::plain
+
+    %% ================= 视觉编码器 (可选分支) =================
+    subgraph vision["Vision Encoder (Glm5NextVisionModel, 可选分支)"]
+        vpatch["patch_embed (Conv3d)<br/>[1024, 3, 2, 14, 14], stride=kernel"]:::plain
+        subgraph vloop["for blk in 24 VisionBlocks"]
+            vn1["norm1 (RMSNorm)<br/>[1024], eps(1e-5)"]:::act
+            vattn["VisionAttention<br/>qkv [3072, 1024]; q/k RMSNorm [64] eps(1e-5); 2D RoPE (theta 1e4); proj [1024, 1024]"]:::matmul
+            vadd1["+ residual"]:::plain
+            vn2["norm2 (RMSNorm)<br/>[1024], eps(1e-5)"]:::act
+            vmlp["VisionMLP SwiGLU<br/>gate/up [4096, 1024] → down [1024, 4096], clamp ±10"]:::matmul
+            vadd2["+ residual"]:::plain
+        end
+        vpost["post_layernorm (RMSNorm [1024]) + 2×2 重排<br/>downsample (Conv2d) [4096, 1024, 2, 2], stride 2"]:::plain
+        vmerger["PatchMerger: proj [4096, 4096] → LayerNorm → GELU<br/>SwiGLU gate/up [10240, 4096] → down [4096, 10240], clamp ±10"]:::matmul
+    end
+
+    scatter["masked_scatter: 图像/视频嵌入替换占位符 token 嵌入"]:::plain
+    expand["unsqueeze + expand × hc_mult(4) → mHC 4 流<br/>[B, S, hc(4), 4096]"]:::plain
+
+    %% ================= 45 层解码器 =================
+    subgraph loop["for layer_idx in 0..44 — 45× DecoderLayer (34×linear_attention + 11×deepseek_sparse_attention)"]
+
+        %% ---- attn 侧 mHC ----
+        subgraph hc1["attn_hc (mHC Manifold-Constrained HyperConnection)"]
+            h_norm["input_norm (无权重 RMSNorm, fp32)<br/>flatten [B, S, hc(16384)], eps(1e-5)"]:::act
+            h_fn["F.linear(flat, fn) + base, ×scale<br/>fn [(2+4)·4 = 24, hc(16384)]; base [24]; scale [3]"]:::matmul
+            h_split["split → pre/post/comb_logits<br/>pre = σ(·)+ε [B, S, 4]; post = 2σ(·) [B, S, 4]"]:::act
+            h_sink["reshape [B, S, 4, 4] → softmax(行) + Sinkhorn(20)<br/>doubly stochastic comb"]:::act
+            h_collapse["collapse = Σ pre·stream<br/>[B, S, 4096]"]:::plain
+        end
+
+        iln["input_layernorm (RMSNorm)<br/>[H(4096)], eps(1e-5)"]:::act
+
+        %% ---- KDA 线性注意力分支 (34 层) ----
+        subgraph linb["linear_attention ×34 — KDA (Kimi Delta Attention)"]
+            l_mask["× padding 掩码 (置零)<br/>[B, S, 4096]"]:::plain
+            l_qkv["q_proj + k_proj + v_proj (Linear ×3) → cat<br/>[qkv_dim(8192), H(4096)] 各, bias(False)"]:::matmul
+            l_conv["causal Conv1d (depthwise) + SiLU<br/>[24576], k(4), groups(24576)<br/>更新 conv_state 缓存"]:::plain
+            l_split["split + reshape<br/>q, k, v [B, S, nh(64), dk(128)]"]:::plain
+            l_fg["forget_gate: f_a [dk(128), H(4096)] → f_b [qkv_dim(8192), 128]<br/>+ dt_bias [8192]; g = −5·σ(e^A_log(64)·g)<br/>g [B, S, 64, 128]"]:::matmul
+            l_beta["b_proj (Linear) → σ = β<br/>[nh(64), H(4096)], bias(False)"]:::matmul
+            l_kda["chunk_kimi_delta_attention (chunk 64): l2norm(q,k), q/√128<br/>逐维衰减 delta rule: S ← e^g·S + kᵀ(v−Sk)·β; o = q·S<br/>recurrent state [B, nh(64), dk(128), dv(128)] → 缓存"]:::matmul
+            l_ggate["输出门: g_a [dk(128), H(4096)] → g_b [qkv_dim(8192), 128]<br/>gate [B, S, 64, 128]"]:::matmul
+            l_norm["o_norm (RMSNormGated, × σ(gate))<br/>[dv(128)], eps(1e-5)"]:::act
+            l_o["o_proj (Linear)<br/>[H(4096), qkv_dim(8192)], bias(False)"]:::matmul
+        end
+
+        %% ---- MLA + DSA 稀疏注意力分支 (11 层) ----
+        subgraph fullb["deepseek_sparse_attention ×11 — MLA (NoPE) + DSA indexer"]
+            subgraph idx["DSA Indexer — k-pool 压缩 + topk 选择"]
+                i_wqb["wq_b (Linear)<br/>[nh_i(32)·Id(128) = 4096, q_lora(1536)]<br/>→ q_i [B, S, 32, 128]"]:::matmul
+                i_wk["wk (Linear) + k_norm (LayerNorm)<br/>[Id(128), H(4096)], eps(1e-6)<br/>→ k [B, S, 128]"]:::matmul
+                i_gate["compress gate scores (Linear)<br/>gate 参数 [Id(128), H(4096)]<br/>→ [B, S, 128]"]:::matmul
+                i_cache["update_indexer: packed 缓存拼接<br/>[k, gate, valid] → [B, S_full, 257]"]:::dashed
+                i_pool["k-pool 池化 (kpool(4) token/池): 学习加权平均<br/>softmax(gate + ape [4, 128]) → pool_keys [B, S, P, 128]"]:::act
+                i_score["scores = relu(q_i·pool_kᵀ)·(1/√128)<br/>头权重 weights_proj [nh_i(32), H(4096)]/√32 加权和 → pool 分<br/>掩码无效池 → topk(2048/4 = 512) 池"]:::matmul
+                i_expand["池展开 → 原始 token 索引 + 尾部不足一池 (≤3)<br/>topk_indices [B, S, 2051]"]:::plain
+                i_mask["scatter_add → 稀疏布尔掩码<br/>[B, 1, S, S_kv]"]:::plain
+            end
+            f_qa["q_a_proj (Linear)<br/>[q_lora(1536), H(4096)]"]:::matmul
+            f_qan["q_a_layernorm (RMSNorm) = q_resid<br/>[1536], eps(1e-5)"]:::act
+            f_qb["q_b_proj (Linear)<br/>[nq(64)·qk(256) = 16384, q_lora(1536)]<br/>→ q [B, 64, S, 256]"]:::matmul
+            f_kva["kv_a_proj_with_mqa (Linear) + kv_a_layernorm (RMSNorm)<br/>[kv_lora(512)+rope(0) = 512, H(4096)]; [512], eps(1e-5)"]:::matmul
+            f_kvb["kv_b_proj (Linear) → split k_nope / v<br/>[nq(64)·(256+256) = 32768, kv_lora(512)]<br/>k_nope, v [B, 64, S, 256] (k_rot 为空, NoPE)"]:::matmul
+            f_kvcache["update KV cache<br/>K, V [B, nq(64), S_kv, 256]"]:::dashed
+            f_attn["稀疏注意力 (indexer 掩码, sdpa/eager)<br/>softmax(QKᵀ/√256)·V<br/>[B, nq(64), S, 256]"]:::matmul
+            f_o["o_proj (Linear)<br/>[H(4096), 16384]"]:::matmul
+        end
+
+        comb1["mHC combine: post⊗attn_out + combᵀ·streams<br/>[B, S, hc(4), 4096]"]:::plain
+        hc2["ffn_hc (mHC, 结构同 attn_hc)<br/>input_norm → fn [24, 16384] → pre/post/comb (Sinkhorn 20) → collapse"]:::matmul
+        paln["post_attention_layernorm (RMSNorm)<br/>[H(4096)], eps(1e-5)"]:::act
+
+        %% ---- FFN 分支 ----
+        subgraph ffnb["FFN 分支 (按层型)"]
+            subgraph denseb["dense MLP ×3 (layers 0..2)"]
+                d_mlp["SwiGLU MLP<br/>gate/up [Im(12288), H(4096)]; down [H(4096), Im(12288)]<br/>clamp ±swiglu_limit(10), bias(False)"]:::matmul
+            end
+            subgraph moe["MoE ×42 (layers 3..44) — Glm5NextTextMoE"]
+                m_router["TopkRouter: Linear + σ + 偏差修正 + topk(8)<br/>W [E(288), H(4096)]; e_score_correction_bias [288]<br/>fp32, norm_topk_prob, × routed_scaling(2.5)"]:::matmul
+                subgraph eloop["for expert in 命中的专家"]
+                    m_exp["gate_up_proj → SiLU(gate)·up (clamp ±10) → down_proj<br/>gate_up [2·Im(2048) = 4096, H(4096)]; down [H(4096), Im(2048)] (288 份, FP8)"]:::matmul
+                end
+                m_wsum["× topk 权重, index_add 累加<br/>[B, S, 4096]"]:::plain
+                m_shared["shared_expert MLP (×1, SwiGLU)<br/>gate/up [Im(2048), H(4096)]; down [H(4096), Im(2048)]<br/>clamp ±10, bias(False)"]:::matmul
+                m_add["routed + shared<br/>[B, S, 4096]"]:::plain
+            end
+        end
+
+        comb2["mHC combine: post⊗mlp_out + combᵀ·streams<br/>[B, S, hc(4), 4096]"]:::plain
+    end
+
+    %% ================= 输出 =================
+    hchead["hc_head: 4 流无权重 mean<br/>[B, S, 4096]"]:::plain
+    fnorm["norm (RMSNorm)<br/>[H(4096)], eps(1e-5)"]:::act
+    lm["lm_head (Linear)<br/>[V(154880), H(4096)], bias(False)"]:::matmul
+    logits["logits<br/>[B, S, 154880]"]:::dashed
+
+    %% ================= 边 =================
+    ids -->|"input_ids [B, S]"| embed
+    pix -->|"pixel_values"| vpatch
+    vpatch -->|"[Nv, 1024]"| vn1
+    vn1 --> vattn
+    vattn --> vadd1
+    vpatch -.->|"[Nv, 1024]"| vadd1
+    vadd1 --> vn2
+    vn2 --> vmlp
+    vmlp --> vadd2
+    vn1 -.->|"[Nv, 1024]"| vadd2
+    vadd2 -->|"[Nv, 1024]"| vpost
+    vpost -->|"[Nv/4, 4096]"| vmerger
+    vmerger -->|"image_embeds [Nv/4, 4096]"| scatter
+    embed -->|"[B, S, 4096]"| scatter
+    scatter -->|"inputs_embeds [B, S, 4096]"| expand
+    expand -->|"streams [B, S, 4, 4096]"| h_norm
+
+    %% attn_hc
+    h_norm -->|"flat [B, S, 16384]"| h_fn
+    h_fn -->|"logits [B, S, 24]"| h_split
+    h_split -->|"comb_logits [B, S, 16]"| h_sink
+    h_split -->|"pre [B, S, 4]"| h_collapse
+    h_sink -->|"comb [B, S, 4, 4]"| comb1
+    h_split -->|"post [B, S, 4]"| comb1
+    h_collapse -->|"[B, S, 4096]"| iln
+    iln -->|"collapse 归一化 [B, S, 4096]"| l_mask
+    iln -->|"collapse 归一化 [B, S, 4096]"| f_qa
+    iln -->|"collapse 归一化 [B, S, 4096]"| f_kva
+    iln -->|"collapse 归一化 [B, S, 4096]"| i_wk
+    iln -->|"collapse 归一化 [B, S, 4096]"| i_gate
+
+    %% KDA 分支
+    masks -->|"padding 掩码 [B, S]"| l_mask
+    l_mask -->|"[B, S, 4096]"| l_qkv
+    l_qkv -->|"cat [B, 24576, S]"| l_conv
+    l_conv --> l_split
+    l_split -->|"q, k, v [B, S, 64, 128]"| l_kda
+    l_mask --> l_fg
+    l_mask --> l_beta
+    l_mask --> l_ggate
+    l_fg -->|"g [B, S, 64, 128]"| l_kda
+    l_beta -->|"β [B, S, 64]"| l_kda
+    l_kda -->|"core_attn_out [B, S, 64, 128]"| l_norm
+    l_ggate -->|"gate [B, S, 64, 128]"| l_norm
+    l_norm -->|"[B, S, 8192]"| l_o
+    l_o -->|"attn_out [B, S, 4096]"| comb1
+
+    %% MLA + DSA 分支
+    f_qa -->|"[B, S, 1536]"| f_qan
+    f_qan -->|"q_resid [B, S, 1536]"| i_wqb
+    f_qan -->|"q_resid [B, S, 1536]"| f_qb
+    i_wk -->|"k [B, S, 128]"| i_cache
+    i_gate -->|"gate_scores [B, S, 128]"| i_cache
+    masks -->|"padding 掩码 [B, S] (valid 通道)"| i_cache
+    i_cache -->|"packed [B, S_full, 257]"| i_pool
+    i_pool -->|"pool_keys [B, S, P, 128]"| i_score
+    i_wqb -->|"q_i [B, S, 32, 128]"| i_score
+    i_score -->|"selected 池索引"| i_expand
+    i_expand -->|"topk_indices [B, S, 2051]"| i_mask
+    i_mask -->|"稀疏掩码 [B, 1, S, S_kv]"| f_attn
+    f_qb -->|"q [B, 64, S, 256]"| f_attn
+    f_kva -->|"k_pass [B, 1, S, 512]"| f_kvb
+    f_kvb -->|"k_nope, v [B, 64, S, 256]"| f_kvcache
+    f_kvcache -->|"K, V [B, 64, S_kv, 256]"| f_attn
+    f_attn -->|"attn_out [B, S, 16384]"| f_o
+    f_o -->|"attn_out [B, S, 4096]"| comb1
+
+    %% mHC combine → FFN
+    comb1 -->|"streams [B, S, 4, 4096]"| hc2
+    hc2 -->|"collapse [B, S, 4096]"| paln
+    hc2 -->|"post [B, S, 4] + comb [B, S, 4, 4]"| comb2
+    paln -->|"dense 层输入 [B, S, 4096]"| d_mlp
+    paln -->|"sparse 层输入 [B, S, 4096]"| m_router
+    paln -->|"sparse 层输入 [B, S, 4096]"| m_shared
+    m_router -->|"indices, weights [B·S, 8]"| m_exp
+    m_exp -->|"expert_out (逐专家)"| m_wsum
+    m_wsum -->|"[B, S, 4096]"| m_add
+    m_shared -->|"shared_out [B, S, 4096]"| m_add
+    m_add -->|"moe_out [B, S, 4096]"| comb2
+    d_mlp -->|"dense_out [B, S, 4096]"| comb2
+
+    %% 输出
+    comb2 -->|"最后一层 [B, S, 4, 4096]"| hchead
+    hchead -->|"[B, S, 4096]"| fnorm
+    fnorm -->|"[B, S, 4096]"| lm
+    lm -->|"logits [B, S, 154880]"| logits
+
+    style loop fill:none,stroke:#4155c6,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+    style vloop fill:none,stroke:#4155c6,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+    style eloop fill:none,stroke:#4155c6,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+    style idx fill:none,stroke:#4155c6,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+    style hc1 fill:none,stroke:#999999,stroke-width:1px,stroke-dasharray:5 5,color:#191919

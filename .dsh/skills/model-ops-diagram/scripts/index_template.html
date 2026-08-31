@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>模型结构图索引 · Model Structure Diagrams</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    min-height: 100vh;
+    font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+    color: #23283d;
+    background: linear-gradient(160deg, #e8ecf9 0%, #dfe7fb 30%, #eadffb 62%, #d9ecf7 100%);
+    background-attachment: fixed;
+    position: relative;
+    overflow-x: hidden;
+  }
+  /* ---- 背景光斑（衬托毛玻璃的模糊与通透感） ---- */
+  .bg { position: fixed; inset: 0; z-index: -1; pointer-events: none; }
+  .blob { position: absolute; border-radius: 50%; filter: blur(90px); opacity: .55; }
+  .blob.b1 { width: 480px; height: 480px; left: -120px; top: -100px;
+             background: radial-gradient(circle, #8ea6ff, transparent 70%); }
+  .blob.b2 { width: 560px; height: 560px; right: -160px; top: 220px;
+             background: radial-gradient(circle, #d3a4f5, transparent 70%); }
+  .blob.b3 { width: 520px; height: 520px; left: 18%; bottom: -180px;
+             background: radial-gradient(circle, #7fd4d4, transparent 70%); }
+
+  /* ---- 玻璃面板公共样式 ---- */
+  .glass {
+    background: rgba(255, 255, 255, .48);
+    -webkit-backdrop-filter: blur(16px) saturate(1.5);
+    backdrop-filter: blur(16px) saturate(1.5);
+    border: 1px solid rgba(255, 255, 255, .65);
+    box-shadow: 0 8px 32px rgba(80, 90, 180, .14), inset 0 1px 0 rgba(255, 255, 255, .55);
+  }
+
+  header { max-width: 1080px; margin: 34px auto 0; padding: 0 20px; }
+  .header-inner { border-radius: 20px; padding: 26px 34px; }
+  .header-inner h1 { margin: 0 0 8px; font-size: 24px; font-weight: 700;
+                     letter-spacing: .5px; color: #1c2350; }
+  .header-inner p { margin: 0; color: #5c6490; font-size: 13.5px; }
+
+  main { max-width: 1080px; margin: 0 auto; padding: 10px 20px 50px; }
+
+  .series-title {
+    display: inline-flex; align-items: center; gap: 8px;
+    margin: 32px 0 14px; padding: 8px 18px;
+    border-radius: 999px; font-size: 16px; font-weight: 600; color: #2a3163;
+  }
+  .series-title::before { content: ""; width: 9px; height: 9px; border-radius: 50%;
+                          background: linear-gradient(135deg, #6c8cff, #b07ce8);
+                          box-shadow: 0 0 8px rgba(108, 140, 255, .8); }
+  .series-wrap:first-child .series-title { margin-top: 22px; }
+
+  .card { border-radius: 18px; margin-bottom: 16px; overflow: hidden;
+          transition: box-shadow .25s ease; }
+  .card:hover { box-shadow: 0 14px 44px rgba(80, 90, 180, .2), inset 0 1px 0 rgba(255, 255, 255, .6); }
+
+  /* ---- 可折叠的模型头部 ---- */
+  .model-head { display: flex; align-items: center; gap: 12px; padding: 18px 24px;
+                cursor: pointer; user-select: none; flex-wrap: wrap; }
+  .model-head:hover { background: rgba(255, 255, 255, .35); }
+  .model-head .arrow { flex: 0 0 auto; width: 22px; height: 22px; border-radius: 50%;
+                       display: inline-flex; align-items: center; justify-content: center;
+                       background: rgba(108, 140, 255, .16); color: #4a5dc0; font-size: 12px;
+                       transition: transform .25s ease; }
+  .card.open .model-head .arrow { transform: rotate(90deg); background: rgba(108, 140, 255, .3); }
+  .model-head h3 { margin: 0; font-size: 17px; color: #1c2350; }
+  .model-head .dir { margin: 0; font-size: 12px; color: #7c83a8;
+                     font-family: Consolas, "Courier New", monospace; }
+  .model-head .count { margin-left: auto; font-size: 12px; color: #5c6490;
+                       padding: 3px 12px; border-radius: 999px;
+                       background: rgba(108, 140, 255, .12); border: 1px solid rgba(108, 140, 255, .25); }
+
+  /* ---- 文件列表（默认收起） ---- */
+  .files { list-style: none; margin: 0; padding: 4px 14px 12px; display: none; }
+  .card.open .files { display: block; }
+  .files li { display: flex; align-items: center; gap: 12px; padding: 9px 10px;
+              border-top: 1px solid rgba(120, 130, 190, .16);
+              border-radius: 10px; flex-wrap: wrap; transition: background .2s ease; }
+  .files li:hover { background: rgba(255, 255, 255, .5); }
+  .badge { flex: 0 0 auto; min-width: 96px; text-align: center; font-size: 12px;
+           font-weight: 600; padding: 4px 12px; border-radius: 999px; border: 1px solid;
+           -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+           box-shadow: inset 0 1px 0 rgba(255, 255, 255, .5); }
+  .b-svg  { background: rgba(144, 214, 171, .35); color: #10693a; border-color: rgba(90, 180, 130, .55); }
+  .b-png  { background: rgba(140, 190, 240, .35); color: #1a5c94; border-color: rgba(110, 170, 225, .55); }
+  .b-eddx { background: rgba(185, 160, 235, .35); color: #54349e; border-color: rgba(160, 130, 220, .55); }
+  .b-mmd  { background: rgba(160, 168, 190, .30); color: #454c63; border-color: rgba(140, 148, 172, .55); }
+  .b-html { background: rgba(245, 190, 120, .38); color: #8f5410; border-color: rgba(225, 170, 100, .55); }
+  .b-other{ background: rgba(170, 170, 170, .30); color: #4d4d4d; border-color: rgba(150, 150, 150, .55); }
+  .files a { color: #37418a; text-decoration: none; font-weight: 600; font-size: 14px;
+             font-family: Consolas, "Microsoft YaHei", monospace; }
+  .files a:hover { color: #5b6ee1; text-decoration: underline; }
+  .desc { color: #666e94; font-size: 12.5px; }
+
+  footer { text-align: center; color: #838ab0; font-size: 12px; padding: 10px 18px 30px; }
+
+  @media (max-width: 640px) {
+    .header-inner { padding: 20px; }
+    .badge { min-width: 84px; }
+    .model-head .count { margin-left: 0; }
+  }
+</style>
+</head>
+<body>
+<div class="bg" aria-hidden="true">
+  <div class="blob b1"></div>
+  <div class="blob b2"></div>
+  <div class="blob b3"></div>
+</div>
+
+<header>
+  <div class="glass header-inner">
+    <h1>模型结构图索引 · Model Structure Diagrams</h1>
+    <p id="summary">加载中…</p>
+  </div>
+</header>
+<main id="app"></main>
+<footer>按模型系列 / 名称归档；点击模型卡片展开文件列表，链接在新标签页打开（.mmd / .eddx 可能以下载方式打开）。</footer>
+
+<script>
+/* ============================================================================
+ * MODELS —— 唯一需要维护的数据区
+ * ----------------------------------------------------------------------------
+ * 新增模型：在数组末尾追加一个对象；产物放在 <series>/<model>/ 目录下，
+ *   文件命名 {模型名小写、去点、横线转下划线}_structure.{ext}
+ *   （如 Qwen3.8-Flash-Next → qwen38_flash_next_structure.*，
+ *     GLM-5.3-Flash → glm53_flash_structure.*），
+ *   预览页为 {同前缀}_preview.html。
+ * 新增文件：在对应模型的 files 里追加一行 { type, name, desc }。
+ *   type ∈ svg | png | eddx | mmd | html | other（决定徽章样式）
+ *   name 为相对 <series>/<model>/ 的文件名；链接自动拼成 dir + "/" + name
+ * ==========================================================================*/
+const MODELS = [
+  // 示例条目（添加时替换/追加；产物放在 <series>/<model>/ 目录下，
+  // 命名 {模型名小写、去点、横线转下划线}_structure.{ext}）：
+  // {
+  //   series: "Qwen",
+  //   model: "Qwen3.8-Flash-Next",
+  //   dir: "Qwen/Qwen3.8-Flash-Next",
+  //   files: [
+  //     { type: "html", name: "qwen38_flash_next_structure_preview.html", desc: "可缩放预览" },
+  //     { type: "svg",  name: "qwen38_flash_next_structure.svg",          desc: "矢量算子级结构图" },
+  //     { type: "png",  name: "qwen38_flash_next_structure.png",          desc: "高清位图" },
+  //     { type: "eddx", name: "qwen38_flash_next_structure.eddx",         desc: "Edraw 可编辑文件" },
+  //     { type: "mmd",  name: "qwen38_flash_next_structure.mmd",          desc: "Mermaid 源码" },
+  //   ]
+  // },
+];
+/* ================================ /MODELS ================================= */
+
+const TYPE_META = {
+  svg:   { label: "SVG 矢量",  cls: "b-svg" },
+  png:   { label: "PNG 位图",  cls: "b-png" },
+  eddx:  { label: "EDDX 编辑", cls: "b-eddx" },
+  mmd:   { label: "MMD 源码",  cls: "b-mmd" },
+  html:  { label: "HTML 预览", cls: "b-html" },
+  other: { label: "文件",      cls: "b-other" },
+};
+
+function esc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function toggle(head) {
+  head.parentElement.classList.toggle("open");
+}
+
+function render() {
+  const app = document.getElementById("app");
+  const bySeries = new Map();
+  let fileCount = 0;
+  for (const m of MODELS) {
+    if (!bySeries.has(m.series)) bySeries.set(m.series, []);
+    bySeries.get(m.series).push(m);
+    fileCount += m.files.length;
+  }
+  document.getElementById("summary").textContent =
+    MODELS.length + " 个模型 · " + bySeries.size + " 个系列 · " + fileCount + " 个文件（点击模型展开）";
+
+  let html = "";
+  for (const [series, models] of bySeries) {
+    html += '<div class="series-wrap"><div class="series-title glass">' + esc(series) + "</div>";
+    for (const m of models) {
+      html += '<div class="card glass">';
+      html += '<div class="model-head" onclick="toggle(this)" title="点击展开/收起文件列表">' +
+              '<span class="arrow">▶</span><h3>' + esc(m.model) + "</h3>" +
+              '<p class="dir">' + esc(m.dir) + "/</p>" +
+              '<span class="count">' + m.files.length + " 个文件</span></div>";
+      html += '<ul class="files">';
+      for (const f of m.files) {
+        const meta = TYPE_META[f.type] || TYPE_META.other;
+        const href = m.dir + "/" + f.name;
+        html += '<li><span class="badge ' + meta.cls + '">' + meta.label + "</span>" +
+                '<a href="' + esc(href) + '" target="_blank" rel="noopener">' + esc(f.name) + "</a>" +
+                '<span class="desc">' + esc(f.desc || "") + "</span></li>";
+      }
+      html += "</ul></div>";
+    }
+    html += "</div>";
+  }
+  app.innerHTML = html || '<div class="card glass"><p style="padding:18px 24px;margin:0">暂无模型，等待添加…</p></div>';
+}
+render();
+</script>
+</body>
+</html>
