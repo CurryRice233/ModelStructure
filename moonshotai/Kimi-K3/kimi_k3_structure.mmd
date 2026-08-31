@@ -1,0 +1,192 @@
+%% Kimi-K3 整体结构图 (architectures: KimiK3ForConditionalGeneration, model_type kimi_k3, 多模态)
+%% config: https://huggingface.co/moonshotai/Kimi-K3/resolve/main/config.json
+%% modeling: https://huggingface.co/moonshotai/Kimi-K3/resolve/main/modeling_kimi_k3.py + modeling_kimi_linear.py
+%% 文本: H=7168, L=93, vocab 163840, eps 1e-5; 注意力层型: 69× KDA (kda_layers) + 24× MLA (layer 0 + 每 4 层 4..92, NoPE — 代码中无 RoPE 应用)
+%% FFN: layer 0 dense (Im 33792); layers 1-92 MoE: E=896, topk=16, moe_Im=3072, shared=2 (Im 6144), sigmoid 路由 + e_score_correction_bias + renorm, scale 1.0
+%% Latent MoE: routed_expert_hidden_size=3584, down [3584, 7168] → 896 专家 (hidden 3584, MXFP4) → RMSNorm [3584] → up [7168, 3584]
+%% 激活: SiTU = β(4)·tanh(gate/β)·σ(gate) × [25·tanh(up/25)] (hidden_act situ)
+%% KDA 线性注意力: 96 头 ×128, q/k/v 各带 ShortConvolution k=4 + SiLU, forget (f_a/f_b + dt_bias + A_log, 下界 −5), β=σ(b_proj), chunk_kda (l2norm q,k), full-rank 输出门 g_proj, RMSNormGated σ, state [B,96,128,128]
+%% MLA: q_lora 1536 → q_b [96·192=18432]; kv_a [576=512+64] → kv_b [96·256=24576]; q_head_dim 192 (nope 128 + rope 切片未旋转), scale 1/√192, FA2; 输出门 g_proj [12288, 7168] σ; o_proj [7168, 12288]
+%% 注意力残差 (attn_res_block_size=12): prefix_sum 主累加流; 每 12 层快照入 block_residual; _apply_attn_res = softmax((RMSNorm 加权) 分数) 混合 [block_residual; prefix_sum], 每层 attn/mlp 各一次 + 输出一次
+%% 视觉 (MoonViT3d): 27 层, hidden 1024, 12 头 (qkv_hidden 1536, head_dim 128), Im 4096, patch 14, 2D RoPE, RMSNorm, GELU-tanh; tpool_patch_merger 2×2 + 时序均值; 投影 [4·1024=4096 → 4096 → 7168] + RMSNorm
+%% 量化: MXFP4 (group 32) 仅路由专家; 忽略 self_attn/shared_experts/mlp proj/lm_head/vision
+
+flowchart TD
+    classDef matmul fill:#90d6ab,stroke:#101843,stroke-width:1px,color:#191919
+    classDef act fill:#83ebdc,stroke:#101843,stroke-width:1px,color:#191919
+    classDef plain fill:#ffffff,stroke:#101843,stroke-width:1px,color:#191919
+    classDef dashed fill:#ffffff,stroke:#101843,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+
+    %% ================= 输入与嵌入 =================
+    ids["input_ids<br/>[B, S]"]:::dashed
+    pix["pixel_values (图像/视频, 可选)<br/>[Npx, C·T·14·14]"]:::dashed
+    embed["embed_tokens (Embedding)<br/>[V(163840), H(7168)]"]:::plain
+    masks["create_causal_mask (MLA 层 4D 因果)<br/>+ 2D padding 掩码 (KDA 层)"]:::plain
+
+    %% ================= 视觉编码器 (可选分支) =================
+    subgraph vision["Vision Tower (MoonViT3d, 可选分支)"]
+        vpatch["patch_embed (3D patch 14×14)<br/>+ divided-fixed 2D 位置嵌入 (双线性插值)<br/>→ [Nv, 1024]"]:::plain
+        subgraph vloop["for blk in 27 MoonViTEncoderLayers"]
+            vn1["norm0 (RMSNorm)<br/>[1024]"]:::act
+            vattn["wqkv (Linear) + 2D RoPE → varlen FA2 → wo<br/>wqkv [3·1536 = 4608, 1024]; wo [1024, 1536]<br/>12 头, head_dim 128"]:::matmul
+            vadd1["+ residual"]:::plain
+            vn2["norm1 (RMSNorm)<br/>[1024]"]:::act
+            vmlp["MLP2<br/>[1024 → 4096 → 1024], GELU-tanh"]:::matmul
+            vadd2["+ residual"]:::plain
+        end
+        vfinal["final_layernorm (RMSNorm [1024])<br/>+ tpool_patch_merger: 2×2 空间重排 + 时序均值池化"]:::plain
+        vproj["mm_projector (PatchMergerMLPV2)<br/>Linear [4096, 4096] → GELU → Linear [7168, 4096], bias(False)<br/>→ RMSNorm [7168]"]:::matmul
+    end
+
+    merge["_merge_input_ids_with_image_features<br/>图像特征替换占位符 token (163605), 序列扩展<br/>inputs_embeds [B, S', 7168]"]:::plain
+
+    %% ================= 93 层解码器 =================
+    subgraph loop["for layer_idx in 0..92 — 93× DecoderLayer (24×MLA + 69×KDA; layer 0 dense FFN)"]
+
+        %% ---- 注意力残差机制 ----
+        subgraph ares["注意力残差 (attn_res_block_size 12)"]
+            ares1["_apply_attn_res (attn 位): v = cat(block_residual, prefix_sum)<br/>k = RMSNorm 式归一 × (res_norm 权重 ⊙ res_proj [1, 7168]) → softmax 分数 → 加权混合<br/>self_attention_res_norm [7168] + self_attention_res_proj"]:::act
+            ares_snap["每 12 层 (idx % 12 == 0):<br/>prefix_sum 快照推入 block_residual"]:::plain
+        end
+
+        iln["input_layernorm (RMSNorm)<br/>[H(7168)], eps(1e-5)"]:::act
+
+        %% ---- KDA 线性注意力分支 (69 层) ----
+        subgraph linb["linear_attention ×69 — KimiDeltaAttention (KDA)"]
+            l_qkv["q_proj + k_proj + v_proj (Linear ×3)<br/>[nh(96)·Id(128) = 12288, H(7168)] 各, bias(False)"]:::matmul
+            l_conv["ShortConvolution ×3 (q/k/v 各, depthwise) + SiLU<br/>[12288], k(4) 各; 更新 conv_state 缓存"]:::plain
+            l_fg["forget gate: f_a [Id(128), H(7168)] → f_b [12288, 128]<br/>+ dt_bias [12288]; decay e^A_log(96); safe 下界 −5"]:::matmul
+            l_beta["b_proj (Linear) → β (σ 在核内)<br/>[nh(96), H(7168)]"]:::matmul
+            l_kda["chunk_kda: l2norm(q,k), 门控/β 融合核<br/>delta rule 递归; recurrent state [B, nh(96), 128, 128] → 缓存"]:::matmul
+            l_gate["输出门 (full-rank): g_proj (Linear)<br/>[12288, H(7168)]"]:::matmul
+            l_norm["o_norm (FusedRMSNormGated × σ(g))<br/>[Id(128)], eps(1e-5)"]:::act
+            l_o["o_proj (Linear)<br/>[H(7168), 12288]"]:::matmul
+        end
+
+        %% ---- MLA 分支 (24 层, NoPE) ----
+        subgraph fullb["full_attention ×24 — KimiMLAAttention (NoPE)"]
+            f_qa["q_a_proj (Linear)<br/>[q_lora(1536), H(7168)]"]:::matmul
+            f_qan["q_a_layernorm (RMSNorm)<br/>[1536], eps(1e-5)"]:::act
+            f_qb["q_b_proj (Linear)<br/>[nq(96)·(nope(128)+rope(64)) = 18432, q_lora(1536)]<br/>→ q_pass/q_rot 切分 (无 RoPE 旋转)"]:::matmul
+            f_kva["kv_a_proj_with_mqa (Linear)<br/>[kv_lora(512)+rope(64) = 576, H(7168)]"]:::matmul
+            f_kvan["kv_a_layernorm (RMSNorm)<br/>[512], eps(1e-5)"]:::act
+            f_kvb["kv_b_proj (Linear) → split k_nope / v<br/>[nq(96)·(128+128) = 24576, kv_lora(512)]<br/>k_rot 扩展至全部头 (未旋转)"]:::matmul
+            f_kvcache["update KV cache (KimiDynamicCache)<br/>K [B, 96, S_kv, 192]; V [B, 96, S_kv, 128]"]:::dashed
+            f_attn["flash_attention_2<br/>softmax(QKᵀ/√192)·V<br/>[B, nq(96), S, 128]"]:::matmul
+            f_gate["输出门: g_proj (Linear) → σ × attn_out<br/>[nq·v_dim = 12288, H(7168)]"]:::matmul
+            f_o["o_proj (Linear)<br/>[H(7168), 12288]"]:::matmul
+        end
+
+        psum1["prefix_sum += attn_out<br/>(主累加流) [B, S, 7168]"]:::plain
+        ares2["_apply_attn_res (mlp 位)<br/>mlp_res_norm [7168] + mlp_res_proj [1, 7168]<br/>同型 softmax 混合"]:::act
+        paln["post_attention_layernorm (RMSNorm)<br/>[H(7168)], eps(1e-5)"]:::act
+
+        %% ---- FFN 分支 ----
+        subgraph ffnb["FFN 分支 (按层)"]
+            subgraph denseb["dense MLP ×1 (layer 0)"]
+                d_mlp["KimiMLP (SiTU)<br/>gate/up [Im(33792), H(7168)]; down [H(7168), Im(33792)]<br/>SiTU: 4·tanh(gate/4)·σ(gate) × 25·tanh(up/25)"]:::matmul
+            end
+            subgraph moe["MoE ×92 (layers 1-92) — KimiSparseMoeBlock + Latent"]
+                m_gate["KimiMoEGate: Linear + σ + 偏差修正 + topk(16)<br/>W [E(896), H(7168)] fp32; e_score_correction_bias [896]<br/>renorm, × scaling(1.0)"]:::matmul
+                m_down["routed_expert_down_proj (Linear)<br/>[latent(3584), H(7168)]"]:::matmul
+                subgraph eloop["for expert in 命中的专家"]
+                    m_exp["KimiBlockSparseMLP (SiTU)<br/>w1/w3 (gate/up) [moe_Im(3072), latent(3584)]; w2 (down) [latent(3584), 3072]<br/>(896 份, MXFP4 量化)"]:::matmul
+                end
+                m_wsum["× topk 权重, 按专家求和<br/>[B·S, 3584]"]:::plain
+                m_up["routed_expert_norm (RMSNorm [3584])<br/>+ routed_expert_up_proj (Linear) [H(7168), latent(3584)]"]:::matmul
+                m_shared["shared_experts KimiMLP ×2 (SiTU)<br/>gate/up [2·moe_Im = 6144, H(7168)]; down [H(7168), 6144]"]:::matmul
+                m_add["routed + shared<br/>[B, S, 7168]"]:::plain
+            end
+        end
+
+        psum2["prefix_sum += mlp_out<br/>[B, S, 7168] → 下一层"]:::plain
+    end
+
+    %% ================= 输出 =================
+    outres["_apply_output_attn_res<br/>output_attn_res_norm [7168] + output_attn_res_proj [1, 7168]<br/>softmax 混合 (block_residual + prefix_sum)"]:::act
+    fnorm["norm (RMSNorm)<br/>[H(7168)], eps(1e-5)"]:::act
+    lm["lm_head (Linear)<br/>[V(163840), H(7168)], bias(False)"]:::matmul
+    logits["logits<br/>[B, S, 163840]"]:::dashed
+
+    %% ================= 边 =================
+    ids -->|"input_ids [B, S]"| embed
+    pix -->|"pixel_values"| vpatch
+    vpatch -->|"[Nv, 1024]"| vn1
+    vn1 --> vattn
+    vattn --> vadd1
+    vpatch -.->|"[Nv, 1024]"| vadd1
+    vadd1 --> vn2
+    vn2 --> vmlp
+    vmlp --> vadd2
+    vn1 -.->|"[Nv, 1024]"| vadd2
+    vadd2 -->|"[Nv, 1024]"| vfinal
+    vfinal -->|"2×2 合并 + 时序池化 [Σ, 4, 1024]"| vproj
+    vproj -->|"image_features [Nt, 7168]"| merge
+    embed -->|"[B, S, 7168]"| merge
+    merge -->|"inputs_embeds = prefix_sum 初值 [B, S', 7168]"| ares1
+
+    %% 注意力残差 → 注意力
+    ares1 -->|"hidden [B, S, 7168]"| iln
+    psum1 -.->|"prefix_sum"| ares_snap
+    ares_snap -.->|"block_residual [B·S, n_blk, 7168]"| ares1
+    iln -->|"归一化 [B, S, 7168]"| l_qkv
+    iln -->|"归一化 [B, S, 7168]"| f_qa
+    iln -->|"归一化 [B, S, 7168]"| f_kva
+    masks -->|"2D padding 掩码"| l_conv
+    masks -->|"4D 因果掩码"| f_attn
+
+    %% KDA 分支
+    l_qkv -->|"q/k/v [B, S, 12288] ×3"| l_conv
+    l_conv -->|"q, k, v [B, S, 96, 128]"| l_kda
+    iln --> l_fg
+    iln --> l_beta
+    l_fg -->|"g [B, S, 96, 128]"| l_kda
+    l_beta -->|"β [B, S, 96]"| l_kda
+    l_kda -->|"o [B, S, 96, 128]"| l_norm
+    iln --> l_gate
+    l_gate -->|"gate [B, S, 96, 128]"| l_norm
+    l_norm -->|"[B, S, 12288]"| l_o
+    l_o -->|"attn_out [B, S, 7168]"| psum1
+
+    %% MLA 分支
+    f_qa -->|"[B, S, 1536]"| f_qan
+    f_qan -->|"q_residual [B, S, 1536]"| f_qb
+    f_kva -->|"[B, S, 576]"| f_kvan
+    f_kvan -->|"k_pass [B, S, 512]"| f_kvb
+    f_qb -->|"q [B, 96, S, 192]"| f_attn
+    f_kvb -->|"k_nope/v + k_rot → K [B, 96, S, 192], V [B, 96, S, 128]"| f_kvcache
+    f_kvcache -->|"K, V (全历史)"| f_attn
+    f_attn -->|"attn_out [B, S, 12288]"| f_gate
+    iln -->|"输出门输入 [B, S, 7168]"| f_gate
+    f_gate -->|"× σ(g) 后 [B, S, 12288]"| f_o
+    f_o -->|"attn_out [B, S, 7168]"| psum1
+
+    %% attn-res (mlp 位) → FFN
+    psum1 -->|"prefix_sum [B, S, 7168]"| ares2
+    ares_snap -.->|"block_residual"| ares2
+    ares2 -->|"hidden [B, S, 7168]"| paln
+    paln -->|"dense 层输入 [B, S, 7168]"| d_mlp
+    paln -->|"MoE 层输入 [B, S, 7168]"| m_gate
+    paln -->|"MoE 层输入 [B, S, 7168]"| m_down
+    paln -->|"shared 输入 [B, S, 7168]"| m_shared
+    m_gate -->|"indices, weights [B·S, 16]"| m_exp
+    m_down -->|"latent [B·S, 3584]"| m_exp
+    m_exp -->|"expert_out (逐专家)"| m_wsum
+    m_wsum -->|"[B·S, 3584]"| m_up
+    m_up -->|"routed [B, S, 7168]"| m_add
+    m_shared -->|"shared_out [B, S, 7168]"| m_add
+    m_add -->|"moe_out [B, S, 7168]"| psum2
+    d_mlp -->|"dense_out [B, S, 7168]"| psum2
+
+    %% 输出
+    psum2 -->|"最后一层 prefix_sum [B, S, 7168]"| outres
+    ares_snap -.->|"block_residual"| outres
+    outres -->|"[B, S, 7168]"| fnorm
+    fnorm -->|"[B, S, 7168]"| lm
+    lm -->|"logits [B, S, 163840]"| logits
+
+    style loop fill:none,stroke:#4155c6,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+    style vloop fill:none,stroke:#4155c6,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+    style eloop fill:none,stroke:#4155c6,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+    style ares fill:none,stroke:#999999,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+    style ffnb fill:none,stroke:#999999,stroke-width:1px,stroke-dasharray:5 5,color:#191919
