@@ -1,0 +1,190 @@
+%% DeepSeek-V4-Pro-0813 整体结构图 (architectures: DeepseekV4ForCausalLM, model_type deepseek_v4, 纯文本)
+%% config: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813/resolve/main/config.json
+%% modeling: https://github.com/huggingface/transformers/blob/main/src/transformers/models/deepseek_v4/modeling_deepseek_v4.py
+%% H=7168, L=61, vocab 129280; layer_types 由 compress_ratios 映射: 30× heavily_compressed_attention(128) + 28× compressed_sparse_attention(4) + 3× sliding_attention(0, layers 58-60)
+%% mlp_layer_types: 前 3 层 hash_moe (冻结 tid2eid 选专家), 其余 58 层 moe; E=384, topk=6, Im=3072, shared=1, scoring=sqrtsoftplus, scale 2.5, 专家 FP4, swiglu clamp ±10
+%% 注意力: Shared-KV MQA (nkv=1, K=V 同张量), nq=128, head_dim=512, sliding_window=128, scale=512^-0.5, per-head sink [128], eager-only
+%% q 路径: q_lora 1536 (q_a_norm RMSNorm) → q_b [128·512=65536, 1536] → q_b_norm 无权重 + 交错 partial RoPE (rot 64/512)
+%% 输出: o_a_proj GroupedLinear 16 组 (每组 4096→1024, 权重 [16·1024=16384, 4096] bmm) → o_b_proj [7168, 16384]
+%% RoPE 双缓冲: main (θ 1e4, default) 用于 sliding 层; compress (θ 160000, YaRN factor 16, 65536→1M) 用于 CSA/HCA 层与压缩器/索引器; interleaved, partial_rotary 64/512
+%% mHC: hc_mult=4 (流 [B,S,4,7168]), fn [(2+4)·4=24, 4·7168=28672], base [24], scale [3], Sinkhorn 20, eps 1e-6, input_norm 无权重
+%% HCA 压缩器: 每 128 token 窗 → 1 条压缩 KV (softmax(Z+position_bias) 加权和 → RMSNorm → RoPE 窗口位置)
+%% CSA 压缩器: 每 4 token 窗, Ca/Cb 双系列重叠窗 (宽 8, 步长 4); Lightning Indexer: 64 头 ×128, 自有压缩系列 + topk 1024 压缩条目
+%% 其他: rms_norm_eps 1e-6, FP8 block[128,128] 量化 (attention/compressor 分支 BF16), num_nextn_predict_layers=1 (MTP 未在本文件实现)
+
+flowchart TD
+    classDef matmul fill:#90d6ab,stroke:#101843,stroke-width:1px,color:#191919
+    classDef act fill:#83ebdc,stroke:#101843,stroke-width:1px,color:#191919
+    classDef plain fill:#ffffff,stroke:#101843,stroke-width:1px,color:#191919
+    classDef dashed fill:#ffffff,stroke:#101843,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+
+    %% ================= 输入与嵌入 =================
+    ids["input_ids<br/>[B, S]"]:::dashed
+    embed["embed_tokens (Embedding)<br/>[V(129280), H(7168)]"]:::plain
+    expand["unsqueeze + expand × hc_mult(4) → mHC 4 流<br/>[B, S, hc(4), 7168]"]:::plain
+    rope["rotary_emb 双缓冲 (interleaved, rot = 64/512)<br/>main: θ(1e4) default; compress: θ(160000) + YaRN ×16 (65536→1M)<br/>cos/sin [B, S, 32] ×2 套"]:::plain
+    masks["create_sliding_window_causal_mask<br/>滑窗因果掩码, window(128)"]:::plain
+
+    %% ================= 61 层解码器 =================
+    subgraph loop["for layer_idx in 0..60 — 61× DecoderLayer (30×HCA + 28×CSA + 3×sliding; 前 3 层 hash-MoE)"]
+
+        %% ---- attn 侧 mHC ----
+        subgraph hc1["attn_hc (mHC Manifold-Constrained HyperConnection)"]
+            h_norm["input_norm (无权重 RMSNorm, fp32)<br/>flatten [B, S, hc(28672)], eps(1e-6)"]:::act
+            h_fn["F.linear(flat, fn) + base, ×scale<br/>fn [(2+4)·4 = 24, hc(28672)]; base [24]; scale [3]"]:::matmul
+            h_split["split → pre/post/comb_logits<br/>pre = σ(·)+ε [B, S, 4]; post = 2σ(·) [B, S, 4]"]:::act
+            h_sink["reshape [B, S, 4, 4] → softmax(行) + Sinkhorn(20)<br/>doubly stochastic comb"]:::act
+            h_collapse["collapse = Σ pre·stream<br/>[B, S, 7168]"]:::plain
+        end
+
+        iln["input_layernorm (RMSNorm)<br/>[H(7168)], eps(1e-6)"]:::act
+
+        %% ---- 注意力公共路径 (Shared-KV MQA) ----
+        f_qa["q_a_proj (Linear)<br/>[q_lora(1536), H(7168)]"]:::matmul
+        f_qan["q_a_norm (RMSNorm) = q_residual<br/>[1536], eps(1e-6)"]:::act
+        f_qb["q_b_proj (Linear)<br/>[nq(128)·Id(512) = 65536, q_lora(1536)]<br/>→ q [B, 128, S, 512]"]:::matmul
+        f_qbn["q_b_norm (无权重 RMSNorm) + 交错 partial RoPE(rot 64)<br/>按层选 main / compress 套"]:::act
+        f_kv["kv_proj (Linear) + kv_norm (RMSNorm) + RoPE<br/>[Id(512), H(7168)]; [512], eps(1e-6)<br/>K=V 同张量 [B, 1, S, 512]"]:::matmul
+        f_win["sliding-window 缓存更新 (window 128, K=V 共享)<br/>kv [B, 1, S_w, 512]"]:::dashed
+
+        %% ---- 三种层型分支 ----
+        subgraph branches["压缩器分支 (按 layer_type)"]
+            subgraph hcab["heavily_compressed_attention ×30 — HCA 压缩器 (m'=128)"]
+                c_kv["compressor.kv_proj (Linear)<br/>[Id(512), H(7168)] → C 窗特征"]:::matmul
+                c_gate["compressor.gate_proj (Linear)<br/>[Id(512), H(7168)] → Z 门控"]:::matmul
+                c_win["128 token 窗: softmax(Z + position_bias [128, 512]) 加权和<br/>→ kv_norm (RMSNorm [512]) → RoPE(窗口位置, compress θ)<br/>每窗 1 条压缩 KV → 累积 [B, 1, T, 512]"]:::act
+                c_bias["causal block_bias: 查询 t 仅见 ⌊(t+1)/128⌋ 之前条目<br/>[B, 1, S, T] (其余 −∞)"]:::plain
+            end
+            subgraph csab["compressed_sparse_attention ×28 — CSA 压缩器 (m=4) + Lightning Indexer"]
+                s_kv["compressor.kv_proj (Linear)<br/>[2·Id = 1024, H(7168)] → Ca/Cb 双系列"]:::matmul
+                s_gate["compressor.gate_proj (Linear)<br/>[1024, H(7168)] → Z 门控"]:::matmul
+                s_win["重叠窗 (宽 2·4=8, 步长 4): softmax(Z + pos_bias [4, 1024]) 加权和<br/>→ kv_norm (RMSNorm [512]) → RoPE(窗口位置, compress θ)<br/>压缩条目 [B, 1, T, 512]"]:::act
+                subgraph idx["Lightning Indexer — topk 压缩条目"]
+                    i_kv["indexer.kv_proj + gate_proj (Linear ×2)<br/>[2·Id_i = 256, H(7168)]; pos_bias [4, 256]"]:::matmul
+                    i_win["索引压缩系列: 同型重叠窗 (index_head_dim 128)<br/>kv_norm (RMSNorm [128]) + RoPE(窗口位置)<br/>K_IComp [B, T, 128]"]:::act
+                    i_qb["indexer.q_b_proj (Linear) + RoPE(当前位置)<br/>[nh_i(64)·Id_i(128) = 8192, q_lora(1536)]<br/>q_i [B, S, 64, 128] (输入为 q_residual)"]:::matmul
+                    i_score["scores = relu(q_i·K_ICompᵀ)/√128 × 头权重和<br/>头权重 = weights_proj [nh_i(64), H(7168)]/√64<br/>掩未来条目 → topk(1024) 索引 (无效 −1)"]:::matmul
+                end
+                s_gather["gather: 按 topk 索引生成 block_bias<br/>有效条目 0 / 其余 −∞ → [B, 1, S, T]"]:::plain
+            end
+            slidenote["sliding_attention ×3 (layers 58-60)<br/>无压缩器, 仅滑窗 KV"]:::plain
+        end
+
+        f_attn["核心注意力 (eager): KV = concat(滑窗 kv, 压缩条目)<br/>softmax((QKᵀ/√512 ⊕ sink 对数) + 掩码) → 丢 sink 项 → ×V (K=V)<br/>per-head sink 参数 [128]; [B, nq(128), S, 512]"]:::matmul
+        f_rope_out["共轭 RoPE (−sin) 作用于输出 rope 切片 (64 维)<br/>[B, S, 128, 512]"]:::plain
+        f_oa["o_a_proj (GroupedLinear, 块对角)<br/>g(16) 组 × [4096 → o_lora(1024)] bmm<br/>权重 [16384, 4096] → [B, S, 16384]"]:::matmul
+        f_ob["o_b_proj (Linear)<br/>[H(7168), 16384]"]:::matmul
+
+        comb1["mHC combine: post⊗attn_out + combᵀ·streams<br/>[B, S, hc(4), 7168]"]:::plain
+        hc2["ffn_hc (mHC, 结构同 attn_hc)<br/>input_norm → fn [24, 28672] → pre/post/comb (Sinkhorn 20) → collapse"]:::matmul
+        paln["post_attention_layernorm (RMSNorm)<br/>[H(7168)], eps(1e-6)"]:::act
+
+        %% ---- MoE FFN ----
+        subgraph moe["SparseMoeBlock (每层)"]
+            subgraph routers["路由分支 (按 mlp_layer_type)"]
+                r_hash["HashRouter ×3 (layers 0-2): 评分 Linear + sqrtsoftplus<br/>W [E(384), H(7168)]; 选择 = 冻结 tid2eid [V(129280), 6] 查表"]:::matmul
+                r_topk["TopKRouter ×58: Linear + sqrtsoftplus + 偏差修正 + topk(6)<br/>W [E(384), H(7168)]; e_score_correction_bias [384]<br/>权重归一 × routed_scaling(2.5)"]:::matmul
+            end
+            subgraph eloop["for expert in 命中的专家"]
+                m_exp["gate_up_proj → SiLU(gate)·up (clamp ±10) → down_proj<br/>gate_up [2·Im(3072) = 6144, H(7168)]; down [H(7168), Im(3072)] (384 份, FP4)"]:::matmul
+            end
+            m_wsum["× topk 权重, index_add 累加<br/>[B, S, 7168]"]:::plain
+            m_shared["shared_expert MLP (×1, SwiGLU)<br/>gate/up [Im(3072), H(7168)]; down [H(7168), Im(3072)]<br/>clamp ±10"]:::matmul
+            m_add["routed + shared<br/>[B, S, 7168]"]:::plain
+        end
+
+        comb2["mHC combine: post⊗mlp_out + combᵀ·streams<br/>[B, S, hc(4), 7168]"]:::plain
+    end
+
+    %% ================= 输出 =================
+    hchead["hc_head (HyperHead): input_norm 无权重 → F.linear<br/>hc_fn [hc(4), 28672] → σ(·×scale)+base+ε → 加权求和 4 流<br/>[B, S, 7168]"]:::matmul
+    fnorm["norm (RMSNorm)<br/>[H(7168)], eps(1e-6)"]:::act
+    lm["lm_head (Linear)<br/>[V(129280), H(7168)], bias(False)"]:::matmul
+    logits["logits<br/>[B, S, 129280]"]:::dashed
+
+    %% ================= 边 =================
+    ids -->|"input_ids [B, S]"| embed
+    embed -->|"[B, S, 7168]"| expand
+    expand -->|"streams [B, S, 4, 7168]"| h_norm
+
+    %% attn_hc
+    h_norm -->|"flat [B, S, 28672]"| h_fn
+    h_fn -->|"logits [B, S, 24]"| h_split
+    h_split -->|"comb_logits [B, S, 16]"| h_sink
+    h_split -->|"pre [B, S, 4]"| h_collapse
+    h_sink -->|"comb [B, S, 4, 4]"| comb1
+    h_split -->|"post [B, S, 4]"| comb1
+    h_collapse -->|"[B, S, 7168]"| iln
+    iln -->|"collapse 归一化 [B, S, 7168]"| f_qa
+    iln -->|"collapse 归一化 [B, S, 7168]"| f_kv
+    iln -->|"collapse 归一化 [B, S, 7168]"| c_kv
+    iln -->|"collapse 归一化 [B, S, 7168]"| c_gate
+    iln -->|"collapse 归一化 [B, S, 7168]"| s_kv
+    iln -->|"collapse 归一化 [B, S, 7168]"| s_gate
+    iln -->|"collapse 归一化 [B, S, 7168]"| i_kv
+
+    %% q / kv 路径
+    f_qa -->|"[B, S, 1536]"| f_qan
+    f_qan -->|"q_residual [B, S, 1536]"| f_qb
+    f_qan -->|"q_residual [B, S, 1536]"| i_qb
+    rope -->|"cos/sin main"| f_qbn
+    f_qb -->|"q [B, 128, S, 512]"| f_qbn
+    f_qbn -->|"q 旋转后 [B, 128, S, 512]"| f_attn
+    f_kv -->|"kv [B, 1, S, 512]"| f_win
+    rope -->|"cos/sin main/compress"| f_kv
+    f_win -->|"滑窗 kv [B, 1, S_w, 512]"| f_attn
+    masks -->|"滑窗因果掩码"| f_attn
+
+    %% HCA 分支
+    c_kv -->|"C [B, S, 512]"| c_win
+    c_gate -->|"Z [B, S, 512]"| c_win
+    rope -->|"cos/sin compress (窗口位置)"| c_win
+    c_win -->|"压缩 KV [B, 1, T, 512]"| f_attn
+    c_win -->|"条目计数"| c_bias
+    c_bias -->|"block_bias [B, 1, S, T]"| f_attn
+
+    %% CSA 分支
+    s_kv -->|"Ca/Cb [B, S, 1024]"| s_win
+    s_gate -->|"Z [B, S, 1024]"| s_win
+    rope -->|"cos/sin compress (窗口位置)"| s_win
+    s_win -->|"压缩条目 [B, 1, T, 512]"| f_attn
+    s_win -->|"压缩条目 (供索引打分)"| i_score
+    i_kv -->|"索引窗压缩"| i_win
+    i_qb -->|"q_i [B, S, 64, 128]"| i_score
+    i_win -->|"K_IComp [B, T, 128]"| i_score
+    i_score -->|"topk 索引 [B, S, 1024]"| s_gather
+    s_gather -->|"block_bias [B, 1, S, T]"| f_attn
+
+    %% 输出投影
+    f_attn -->|"attn_out [B, S, 128, 512]"| f_rope_out
+    rope -->|"cos/sin (共轭 −sin)"| f_rope_out
+    f_rope_out -->|"[B, S, 65536]"| f_oa
+    f_oa -->|"[B, S, 16384]"| f_ob
+    f_ob -->|"attn_out [B, S, 7168]"| comb1
+
+    %% mHC combine → FFN
+    comb1 -->|"streams [B, S, 4, 7168]"| hc2
+    hc2 -->|"collapse [B, S, 7168]"| paln
+    hc2 -->|"post [B, S, 4] + comb [B, S, 4, 4]"| comb2
+    paln -->|"hash 层输入 [B, S, 7168]"| r_hash
+    paln -->|"moe 层输入 [B, S, 7168]"| r_topk
+    ids -->|"input_ids (tid2eid 查表)"| r_hash
+    r_hash -->|"indices, weights [B·S, 6]"| m_exp
+    r_topk -->|"indices, weights [B·S, 6]"| m_exp
+    m_exp -->|"expert_out (逐专家)"| m_wsum
+    m_wsum -->|"[B, S, 7168]"| m_add
+    paln -->|"shared 输入 [B, S, 7168]"| m_shared
+    m_shared -->|"shared_out [B, S, 7168]"| m_add
+    m_add -->|"moe_out [B, S, 7168]"| comb2
+
+    %% 输出
+    comb2 -->|"最后一层 [B, S, 4, 7168]"| hchead
+    hchead -->|"[B, S, 7168]"| fnorm
+    fnorm -->|"[B, S, 7168]"| lm
+    lm -->|"logits [B, S, 129280]"| logits
+
+    style loop fill:none,stroke:#4155c6,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+    style eloop fill:none,stroke:#4155c6,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+    style idx fill:none,stroke:#4155c6,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+    style hc1 fill:none,stroke:#999999,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+    style branches fill:none,stroke:#999999,stroke-width:1px,stroke-dasharray:5 5,color:#191919
