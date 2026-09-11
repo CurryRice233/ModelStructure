@@ -1,0 +1,188 @@
+%% DeepSeek-V4.1-Flash 整体结构图 (architectures: DeepseekV41ForCausalLM, model_type deepseek_v41, 文本+视觉)
+%% config: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/resolve/main/config.json
+%% modeling: inference/model.py + inference/engram.py + inference/vision.py (仓库自带推理实现)
+%% H=5120, L=40, vocab 129280, eps 1e-20 (极小, 与训练一致), sliding_window=128
+%% compress_ratios (每层一项): layers 0-1 = 0 (仅滑窗), layers 2-19 = 2, layers 20-39 = 1; 另 3 项对应 MTP 层 (40-42, 均为 0)
+%% 跨层共享: kv_source_layers [2,8,14,20] 自己产生共享压缩 KV; index_source_layers [2,8,14,20,24,28,32,36] 自己跑 indexer; 其余层读共享槽位 (shared_attn)
+%% 两级索引: candidate_source_layer=20 先选 top candidate_topk_blocks(2048) 个 block (block_size 8), 后续层只在该候选内打分
+%% indexer: n_heads 32 × head_dim 128, index_topk 512, wq_b [32·128=4096, q_lora 1280], weights_proj [32, 5120], 键来自压缩 latent (wk [128, 512])
+%% 注意力: 共享 KV MQA (head_dim 512, nope 448 + rope 64), 64 头, per-head attn_sink [64], scale 512^-0.5
+%% 输出投影: wo_a 分组块对角 (o_groups 8, 每组 64·512/8=4096 → 1024) → wo_b [5120, 8192]
+%% mHC: hc_mult=4, hc_fn [(2+4)·4=20, hc·d=20480] fp32, base [20], scale [3], Sinkhorn 20, hc_eps 1e-6; pre_mix 由上一个子层产生
+%% MoE: E=384, topk=6, moe_inter_dim=2304, shared=1, score sqrtsoftplus, noaux_tc, route_scale 1.5, experts fp4, swiglu clamp ±10
+%% Engram (layers 1, 14): n-gram 哈希嵌入写入残差流; max_ngram_size 4, n_heads 8 → 24 列, head_dim 256, 表行数 384006168/384016682 (fp8), wkv [25600, 6144]
+%% MTP: num_nextn_predict_layers=3 (DSpark), target layers [37,38,39], block_size 5, markov_rank 256, 128 专家 top-3
+%% 视觉: ViT 32 层, hidden 1024, 16 头, inter 2816, patch 14, downsample_ratio 3; Aligner 3×3 unfold → [5120, 9216] → [5120, 5120]
+
+flowchart TD
+    classDef matmul fill:#90d6ab,stroke:#101843,stroke-width:1px,color:#191919
+    classDef act fill:#83ebdc,stroke:#101843,stroke-width:1px,color:#191919
+    classDef plain fill:#ffffff,stroke:#101843,stroke-width:1px,color:#191919
+    classDef dashed fill:#ffffff,stroke:#101843,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+
+    %% ================= 输入与嵌入 =================
+    ids["input_ids<br/>[B, S]"]:::dashed
+    pix["图像 patches (可选)<br/>[Npat, 3·14·14 = 588]"]:::dashed
+    embed["embed (ParallelEmbedding)<br/>[V(129280), H(5120)]"]:::plain
+    nhash["NgramHashState: 压缩词表映射 + 移位 XOR 哈希<br/>max_ngram_size(4), n_heads(8) → hash_ids [B, S, 2, 24]<br/>(图像 span 记为 DEAD, 不参与 n-gram)"]:::plain
+    expand["unsqueeze + repeat × hc_mult(4)<br/>streams [B, S, hc(4), 5120]<br/>pre_mix 初始为 one-hot"]:::plain
+
+    %% ================= 视觉塔 (可选) =================
+    subgraph vision["Vision (ViT + Aligner, 可选分支)"]
+        vp["PatchEmbed (Linear)<br/>[1024, 3·14·14 = 588]"]:::plain
+        subgraph vloop["for blk in 32 ViT Blocks (双向注意力)"]
+            vn1["norm1 (RMSNorm)<br/>[1024], eps(1e-6)"]:::act
+            vattn["Attention: wqkv [3072, 1024] + 2D RoPE → SDPA → wo [1024, 1024]<br/>16 头, head_dim 64"]:::matmul
+            vadd1["+ residual"]:::plain
+            vn2["norm2 (RMSNorm)<br/>[1024]"]:::act
+            vmlp["SwiGLU MLP<br/>w1 [2·2816 = 5632, 1024] → SiLU × up → w2 [1024, 2816]"]:::matmul
+            vadd2["+ residual"]:::plain
+        end
+        vnorm["norm (RMSNorm)<br/>[1024]"]:::act
+        valign["Aligner: 3×3 unfold (9216) → w1 [H(5120), 9216]<br/>→ GELU → w2 [5120, 5120]"]:::matmul
+        vmerge["merge_image_embeddings<br/>图像行主序写入 IMAGE span; START/END/NEWLINE 用学习嵌入"]:::plain
+    end
+
+    %% ================= 40 层主干 =================
+    subgraph loop["for layer_id in 0..39 — 主层 (compress_ratio: 0/1/2; kv/index 源层共享压缩状态)"]
+
+        %% ---- Engram (layers 1, 14) ----
+        subgraph eng["Engram (engram_layer_ids [1, 14]) — n-gram 检索写入残差流"]
+            en_emb["ParallelEngramEmbedding (fp8 存表, 查表反量化)<br/>[384006168 / 384016682, 256] → flatten [.., 24·256 = 6144]"]:::plain
+            en_kv["wkv (Linear) → key / value 切分<br/>[dim·(hc+1) = 25600, 6144], bias(False)"]:::matmul
+            en_gate["gate = σ(sign(dot)·√|dot|), dot = 归一化内积 / √dim<br/>q_weight / k_weight [hc(4), 5120] fp32"]:::act
+            en_add["x + gate ⊗ value (写入 hc 各副本)<br/>[B, S, hc(4), 5120]"]:::plain
+        end
+
+        %% ---- mHC 系数 ----
+        hc_mix["hc_mixes: 归一化 (rsqrt 均方 + eps) → F.linear(hc_fn)<br/>+ hc_base, × hc_scale → pre / post / comb<br/>hc_fn [(2+4)·4 = 20, 20480] fp32; comb 经 Sinkhorn(20) 双随机"]:::matmul
+        hc_pre_a["hc_pre: 用上一层传入的 pre_mix 折叠 4 副本<br/>[B, S, 5120]"]:::plain
+        anorm["attn_norm (RMSNorm)<br/>[H(5120)], eps(1e-20)"]:::act
+
+        %% ---- Attention ----
+        subgraph attn["Attention — 滑窗 KV 与压缩 KV 拼接后一次稀疏注意力"]
+            a_q["wq_a (Linear) → q_norm (RMSNorm [1280])<br/>→ wq_b [nq(64)·Id(512) = 32768, q_lora(1280)]<br/>→ RoPE(末 64 维)"]:::matmul
+            a_win["wkv (Linear) + kv_norm (RMSNorm [512]) + RoPE(64)<br/>[Id(512), H(5120)] → fp8 量化 → 环形滑窗缓存 (128)"]:::matmul
+            subgraph comp["压缩分支 (compress_ratio > 0)"]
+                c_pool["Compressor: ratio 1 → 直接投影; ratio 2 → wgate + softmax 池化<br/>wkv/wgate [Id(512), H(5120)], RMSNorm [512] → latent"]:::act
+                c_cache["compress_kv_cache (kv_source 2/8/14/20 产生, 全层共享)<br/>[B, S/ratio, 512], 位置按 ratio 缩放 + compress_rope_theta(160000)"]:::dashed
+                i_q["Indexer.wq_b [nh_i(32)·Id_i(128) = 4096, q_lora(1280)]<br/>+ RoPE(64) (输入为 q_residual)"]:::matmul
+                i_k["Indexer.wk [Id_i(128), Id(512)] + k_norm (RMSNorm [128])<br/>+ RoPE(压缩位置); 仅 owns_k 层 (kv_source)"]:::matmul
+                i_cache["index_k_cache (fp4)<br/>[B, S/ratio, 128]"]:::dashed
+                i_score["score = relu(q·kᵀ)·(1/√128) 的头加权和<br/>weights_proj [nh_i(32), H(5120)] · (1/√128·1/√32)<br/>两级筛选: 候选块 top 2048 (block 8, 仅 layer 20) → topk(512)"]:::matmul
+            end
+            a_sparse["sparse_attn(滑窗 KV ⊕ 压缩 KV, attn_sink [64])<br/>scale = Id(512)^-0.5, 每槽独立 → 输出逆 RoPE"]:::matmul
+            a_o["wo_a 分组块对角 (8 组 × [4096 → o_lora(1024)] einsum)<br/>[8192, 4096] → wo_b [H(5120), 8192]"]:::matmul
+        end
+
+        hc_post_a["hc_post: post ⊗ attn_out + Σ comb·residual<br/>→ [B, S, hc(4), 5120]"]:::plain
+        hc_pre_f["hc_pre (用本层 attn 的 pre_mix) + ffn_norm (RMSNorm [5120])<br/>[B, S, 5120]"]:::act
+
+        %% ---- MoE ----
+        subgraph moe["MoE (每层) — 路由专家 + 1 个共享专家"]
+            m_gate["Gate: Linear [E(384), H(5120)] fp32 + sqrtsoftplus<br/>+ bias (图像 span 换成 bias_vl) → topk(6)<br/>权重取原始分数, 归一 × route_scale(1.5)"]:::matmul
+            subgraph eloop["for expert in 命中的专家"]
+                m_exp["Expert (SwiGLU)<br/>w1/w3 [moe_Im(2304), H(5120)] → SiLU(clamp ±10) × up<br/>→ w2 [H(5120), moe_Im(2304)] (384 份, fp4)"]:::matmul
+            end
+            m_shared["shared_expert (Expert ×1)<br/>w1/w3 [2304, 5120]; w2 [5120, 2304], clamp ±10"]:::matmul
+            m_add["routed (× topk 权重) + shared<br/>[B, S, 5120]"]:::plain
+        end
+
+        hc_post_f["hc_post → x<br/>并输出 ffn_pre 作为下一层的 pre_mix<br/>[B, S, hc(4), 5120]"]:::plain
+    end
+
+    %% ================= 输出 =================
+    collapse["hc_pre: 用最后一层 pre_mix 折叠 4 副本<br/>[B, S, 5120]"]:::plain
+    fnorm["norm (RMSNorm)<br/>[H(5120)], eps(1e-20)"]:::act
+    head["head (ParallelHead, fp32)<br/>[V(129280), H(5120)]"]:::matmul
+    logits["logits → sample (Gumbel-max)<br/>[B, S, 129280]"]:::dashed
+
+    %% ================= MTP / DSpark (3 个草稿层) =================
+    subgraph mtp["MTP / DSpark 草稿头 (3 层, target layers [37, 38, 39])"]
+        mt_proj["main_proj [H(5120), 3·5120 = 15360] + main_norm (RMSNorm)<br/>输入 = 目标层 attn 输入 (hc 平均) 拼接"]:::matmul
+        subgraph mloop["for stage in 3 DSparkBlocks"]
+            mt_blk["DSparkAttention + hc 残差 + MoE(128 专家, top-3)<br/>草稿 token 5 个 (block_size), 噪声 token 填充<br/>滑窗 KV 复用主干窗口 + 草稿块内部 KV"]:::matmul
+        end
+        mt_markov["markov_head: embed [V(129280), 256] → ParallelHead → 词表 logits 偏置<br/>逐 token 叠加后采样, 迭代出 5 个草稿 token"]:::matmul
+        mt_conf["confidence_head: proj [1, 5120+256 = 5376]<br/>隐藏态 ⊕ markov 嵌入 → 置信度"]:::matmul
+    end
+
+    %% ================= 边 =================
+    ids -->|"input_ids [B, S]"| embed
+    ids -->|"input_ids"| nhash
+    pix -->|"patches"| vp
+    vp -->|"[Npat, 1024]"| vn1
+    vn1 --> vattn
+    vattn --> vadd1
+    vp -.->|"[Npat, 1024]"| vadd1
+    vadd1 --> vn2
+    vn2 --> vmlp
+    vmlp --> vadd2
+    vn1 -.->|"[Npat, 1024]"| vadd2
+    vadd2 -->|"[Npat, 1024]"| vnorm
+    vnorm -->|"[Npat, 1024]"| valign
+    valign -->|"图像特征 [Nt, 5120]"| vmerge
+    vmerge -.->|"写入图像 span"| embed
+    embed -->|"[B, S, 5120]"| expand
+    expand -->|"streams [B, S, 4, 5120]"| en_emb
+    nhash -->|"hash_ids [B, S, 2, 24] (按层切片)"| en_emb
+    expand -->|"streams (layer 0 直通)"| hc_mix
+    en_emb -->|"[.., 6144]"| en_kv
+    en_kv -->|"key [B,S,4,5120]; value [B,S,5120]"| en_gate
+    expand -->|"x 副本 [B,S,4,5120]"| en_gate
+    en_gate -->|"gate [B, S, 4]"| en_add
+    en_kv -->|"value [B, S, 5120]"| en_add
+    expand -->|"x 副本"| en_add
+    en_add -->|"streams (仅 layer 1/14 注入后)"| hc_mix
+
+    %% mHC → 注意力
+    hc_mix -->|"pre [B,S,4]; post [B,S,4]; comb [B,S,4,4]"| hc_pre_a
+    hc_mix -->|"post / comb"| hc_post_a
+    hc_pre_a -->|"折叠后 [B, S, 5120]"| anorm
+    anorm -->|"归一化 [B, S, 5120]"| a_q
+    anorm -->|"归一化 [B, S, 5120]"| a_win
+    anorm -->|"归一化 [B, S, 5120]"| c_pool
+    anorm -->|"归一化 (ratio > 0 层)"| i_q
+    a_q -->|"q [B, 64, S, 512]"| a_sparse
+    a_win -->|"滑窗 KV [B, 128, 512] + topk 槽位索引"| a_sparse
+    c_pool -->|"latent (RoPE 前) [B, S/ratio, 512]"| c_cache
+    c_pool -.->|"latent (供 indexer 建键)"| i_k
+    c_cache -->|"压缩 KV [B, S/ratio, 512] (全层共享)"| a_sparse
+    i_q -->|"q_i [B, 32, S, 128]"| i_score
+    i_k -->|"索引键 [B, S/ratio, 128]"| i_cache
+    i_cache -->|"index_k (fp4)"| i_score
+    i_score -->|"压缩位置索引 [B, S, 512] (+offset)"| a_sparse
+    a_sparse -->|"attn_out [B, S, 64, 512]"| a_o
+    a_o -->|"attn_out [B, S, 5120]"| hc_post_a
+    hc_post_a -->|"streams [B, S, 4, 5120]"| hc_pre_f
+    hc_pre_f -->|"折叠归一化 [B, S, 5120]"| m_gate
+    hc_pre_f -->|"折叠归一化 [B, S, 5120]"| m_shared
+    m_gate -->|"indices, weights [B·S, 6]"| m_exp
+    m_exp -->|"expert_out (逐专家 × 权重)"| m_add
+    m_shared -->|"shared_out [B, S, 5120]"| m_add
+    m_add -->|"moe_out [B, S, 5120]"| hc_post_f
+    hc_mix -->|"ffn 的 pre/post/comb"| hc_post_f
+    hc_post_f -->|"streams + pre_mix (下一层)"| hc_mix
+
+    %% 输出
+    hc_post_f -->|"最后一层 streams [B, S, 4, 5120]"| collapse
+    collapse -->|"[B, S, 5120]"| fnorm
+    fnorm -->|"[B, S, 5120]"| head
+    head -->|"logits [B, S, 129280]"| logits
+
+    %% MTP
+    hc_post_a -.->|"目标层 attn 输入 (hc 平均) ×3"| mt_proj
+    head -.->|"共享 embed / head"| mt_markov
+    mt_proj -->|"main_x [B, S, 5120]"| mt_blk
+    mt_blk -->|"draft 隐状态 [B, 5, 5120]"| mt_markov
+    mt_blk -->|"draft 隐状态"| mt_conf
+    mt_markov -->|"markov 嵌入 [B, 5, 256]"| mt_conf
+    mt_conf -->|"置信度 [B, 5]"| logits
+
+    style loop fill:none,stroke:#4155c6,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+    style vloop fill:none,stroke:#4155c6,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+    style eloop fill:none,stroke:#4155c6,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+    style mloop fill:none,stroke:#4155c6,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+    style comp fill:none,stroke:#999999,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+    style eng fill:none,stroke:#999999,stroke-width:1px,stroke-dasharray:5 5,color:#191919
+    style mtp fill:none,stroke:#999999,stroke-width:1px,stroke-dasharray:5 5,color:#191919
